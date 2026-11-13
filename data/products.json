@@ -1,0 +1,58 @@
+[
+  {
+    "id": 1,
+    "name": "Kit Safari Infantil",
+    "price": 1990,
+    "description": "Kit Safari Infantil",
+    "files": []
+  },
+  {
+    "id": 2,
+    "name": "Estampa Floral Delicada",
+    "price": 1290,
+    "description": "Estampa Floral Delicada",
+    "files": []
+  },
+  {
+    "id": 3,
+    "name": "Arte Street Wear",
+    "price": 1490,
+    "description": "Arte Street Wear",
+    "files": []
+  },
+  {
+    "id": 4,
+    "name": "Coleção PNG para Sublimação",
+    "price": 2490,
+    "description": "Coleção PNG para Sublimação",
+    "files": []
+  },
+  {
+    "id": 5,
+    "name": "Kit Vetores para Camisetas",
+    "price": 2990,
+    "description": "Kit Vetores para Camisetas",
+    "files": []
+  },
+  {
+    "id": 6,
+    "name": "Ursinhas e Laços",
+    "price": 1690,
+    "description": "Ursinhas e Laços",
+    "files": []
+  },
+  {
+    "id": 7,
+    "name": "Frases para Camisetas",
+    "price": 990,
+    "description": "Frases para Camisetas",
+    "files": []
+  },
+  {
+    "id": 8,
+    "name": "Emblemas Esportivos",
+    "price": 2190,
+    "description": "Emblemas Esportivos",
+    "files": []
+  }
+]

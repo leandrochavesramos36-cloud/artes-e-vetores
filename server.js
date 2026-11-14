@@ -4,185 +4,53 @@ import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
 import pg from "pg";
 import crypto from "node:crypto";
-import fs from "node:fs";
+import multer from "multer";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 dotenv.config();
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
-const PORT = Number(process.env.PORT || 3000);
-const HANDLE = (process.env.INFINITEPAY_HANDLE || "leandroartefinalista").replace(/^\$/, "");
-const API_KEY = process.env.INFINITEPAY_API_KEY || "";
-const BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined });
-const products = JSON.parse(fs.readFileSync(path.join(__dirname, "data", "products.json"), "utf8"));
-
-app.set("trust proxy", 1);
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "100kb" }));
-app.use("/api/", rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: "draft-7", legacyHeaders: false }));
-app.use(express.static(path.join(__dirname, "public")));
-
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS orders (
-      id UUID PRIMARY KEY,
-      access_token TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      customer_name TEXT NOT NULL,
-      customer_email TEXT NOT NULL,
-      items JSONB NOT NULL,
-      amount_cents INTEGER NOT NULL,
-      checkout_url TEXT,
-      transaction_nsu TEXT,
-      invoice_slug TEXT,
-      capture_method TEXT,
-      receipt_url TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
+const root=path.dirname(fileURLToPath(import.meta.url));
+const app=express(), PORT=Number(process.env.PORT||3000);
+const HANDLE=(process.env.INFINITEPAY_HANDLE||"").replace(/^\$/,"");
+const API_KEY=process.env.INFINITEPAY_API_KEY||"";
+const BASE=(process.env.PUBLIC_BASE_URL||"").replace(/\/$/,"");
+const SB=(process.env.SUPABASE_URL||"").replace(/\/$/,"");
+const SERVICE=process.env.SUPABASE_SERVICE_ROLE_KEY||"";
+const BUCKET=process.env.SUPABASE_STORAGE_BUCKET||"product-files";
+const ADMIN=process.env.ADMIN_PASSWORD||"", SECRET=process.env.SESSION_SECRET||"";
+const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_SSL==="true"?{rejectUnauthorized:false}:undefined});
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:100*1024*1024,files:12}});
+app.set("trust proxy",1);
+app.use(helmet({contentSecurityPolicy:false}));
+app.use(express.json({limit:"200kb"}));
+app.use("/api/",rateLimit({windowMs:60000,limit:90,standardHeaders:"draft-7",legacyHeaders:false}));
+app.use(express.static(path.join(root,"public")));
+const b64=s=>Buffer.from(s).toString("base64url");
+const sign=s=>crypto.createHmac("sha256",SECRET).update(s).digest("base64url");
+function cookieToken(req){const v=(req.headers.cookie||"").split(";").map(x=>x.trim()).find(x=>x.startsWith("av_admin="))?.slice(9)||"";const [p,s]=v.split(".");if(!p||!s||!SECRET)return false;const expected=sign(p);return s.length===expected.length&&crypto.timingSafeEqual(Buffer.from(s),Buffer.from(expected))&&Buffer.from(p,"base64url").toString()==="admin";}
+function admin(req,res,next){if(!cookieToken(req))return res.status(401).json({error:"Faça login no painel administrativo."});next();}
+function origin(){if(!BASE.startsWith("https://"))throw Error("PUBLIC_BASE_URL HTTPS não configurada.");return BASE;}
+function storageReady(){return SB.startsWith("https://")&&SERVICE.length>20;}
+async function storage(method,pathName,body,contentType){if(!storageReady())throw Error("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no Render.");const response=await fetch(SB+"/storage/v1"+pathName,{method,headers:{apikey:SERVICE,Authorization:"Bearer "+SERVICE,...(contentType?{"Content-Type":contentType}:{})},body});const data=await response.json().catch(()=>({}));if(!response.ok)throw Error(data.message||data.error||"Falha no armazenamento privado.");return data;}
+async function uploadFile(file){const key=crypto.randomUUID()+"-"+file.originalname.replace(/[^a-zA-Z0-9._-]/g,"_");await storage("POST","/object/"+BUCKET+"/"+key,file.buffer,file.mimetype||"application/octet-stream");return key;}
+async function signedUrl(key,seconds=300){const d=await storage("POST","/object/sign/"+BUCKET+"/"+key,JSON.stringify({expiresIn:seconds}),"application/json");return SB+"/storage/v1"+(d.signedURL||d.signedUrl||"");}
+async function initDb(){
+ await pool.query(\`CREATE TABLE IF NOT EXISTS orders(id UUID PRIMARY KEY,access_token TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',customer_name TEXT NOT NULL,customer_email TEXT NOT NULL,items JSONB NOT NULL,amount_cents INTEGER NOT NULL,checkout_url TEXT,transaction_nsu TEXT,invoice_slug TEXT,capture_method TEXT,receipt_url TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())\`);
+ await pool.query(\`CREATE TABLE IF NOT EXISTS products(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',category TEXT NOT NULL DEFAULT 'PNG',formats TEXT NOT NULL DEFAULT 'PNG',price_cents INTEGER NOT NULL CHECK(price_cents>=100),preview_path TEXT,files JSONB NOT NULL DEFAULT '[]'::jsonb,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())\`);
 }
-
-function publicOrigin(req) {
-  if (BASE_URL) return BASE_URL;
-  throw new Error("Configure PUBLIC_BASE_URL com o endereço HTTPS público da loja.");
-}
-function moneyBRL(cents) { return (cents / 100).toFixed(2); }
-
-app.post("/api/checkout", async (req, res) => {
-  try {
-    const { items, customer } = req.body || {};
-    if (!Array.isArray(items) || items.length < 1 || items.length > 30) return res.status(400).json({ error: "Carrinho inválido." });
-    const name = String(customer?.name || "").trim().slice(0, 120);
-    const email = String(customer?.email || "").trim().toLowerCase().slice(0, 180);
-    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Informe nome e e-mail válidos." });
-
-    const normalized = [];
-    for (const item of items) {
-      const product = products.find(p => p.id === Number(item.id));
-      const quantity = Number(item.quantity);
-      if (!product || !Number.isInteger(quantity) || quantity < 1 || quantity > 20) return res.status(400).json({ error: "Produto ou quantidade inválidos." });
-      normalized.push({ id: product.id, name: product.name, price: product.price, quantity, files: product.files });
-    }
-    const total = normalized.reduce((sum, p) => sum + p.price * p.quantity, 0);
-    if (!Number.isSafeInteger(total) || total < 100) return res.status(400).json({ error: "O valor mínimo do pedido é R$ 1,00." });
-
-    const id = crypto.randomUUID();
-    const accessToken = crypto.randomBytes(32).toString("hex");
-    await pool.query(
-      "INSERT INTO orders (id, access_token, customer_name, customer_email, items, amount_cents) VALUES ($1,$2,$3,$4,$5,$6)",
-      [id, accessToken, name, email, JSON.stringify(normalized), total]
-    );
-
-    const payload = {
-      items: normalized.map(p => ({ quantity: p.quantity, price: p.price, description: p.name })),
-      order_nsu: id,
-      redirect_url: `${publicOrigin(req)}/pagamento-retorno?order=${encodeURIComponent(id)}&token=${encodeURIComponent(accessToken)}`,
-      webhook_url: `${publicOrigin(req)}/api/webhooks/infinitepay`,
-      customer: { name, email }
-    };
-    // API key is optional for basic checkout creation. If present, it is sent only server-side.
-    const headers = { "Content-Type": "application/json" };
-    if (API_KEY) headers["X-Api-Key"] = API_KEY;
-    else payload.handle = HANDLE;
-
-    const ipResponse = await fetch("https://api.checkout.infinitepay.io/links", {
-      method: "POST", headers, body: JSON.stringify(payload)
-    });
-    const ipData = await ipResponse.json().catch(() => ({}));
-    if (!ipResponse.ok || !ipData.url) {
-      await pool.query("UPDATE orders SET status='checkout_error', updated_at=NOW() WHERE id=$1", [id]);
-      return res.status(502).json({ error: "A InfinitePay não conseguiu criar o checkout. Confira se o Checkout Integrado está habilitado na sua conta." });
-    }
-    await pool.query("UPDATE orders SET checkout_url=$2, updated_at=NOW() WHERE id=$1", [id, ipData.url]);
-    res.json({ checkout_url: ipData.url, order_id: id });
-  } catch (error) {
-    console.error("checkout_error", error);
-    res.status(500).json({ error: "Erro interno ao iniciar o pagamento." });
-  }
-});
-
-async function confirmPayment({ order_nsu, transaction_nsu, slug, receipt_url, capture_method }) {
-  if (!order_nsu || !transaction_nsu || !slug) return false;
-  const found = await pool.query("SELECT id,status FROM orders WHERE id=$1", [order_nsu]);
-  if (!found.rowCount) return false;
-  const headers = { "Content-Type": "application/json" };
-  if (API_KEY) headers["X-Api-Key"] = API_KEY;
-  const check = await fetch("https://api.checkout.infinitepay.io/payment_check", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ handle: HANDLE, order_nsu, transaction_nsu, slug })
-  });
-  const result = await check.json().catch(() => ({}));
-  if (!check.ok || result.success !== true || result.paid !== true) return false;
-  await pool.query(
-    `UPDATE orders SET status='paid', transaction_nsu=$2, invoice_slug=$3,
-     capture_method=$4, receipt_url=$5, updated_at=NOW() WHERE id=$1`,
-    [order_nsu, transaction_nsu, slug, capture_method || null, receipt_url || null]
-  );
-  return true;
-}
-
-app.post("/api/webhooks/infinitepay", async (req, res) => {
-  try {
-    const body = req.body || {};
-    if (body.event === "refunded" || body.status === "refunded") {
-      if (body.order_nsu) await pool.query("UPDATE orders SET status='refunded', updated_at=NOW() WHERE id=$1", [body.order_nsu]);
-      return res.sendStatus(200);
-    }
-    const ok = await confirmPayment({
-      order_nsu: body.order_nsu,
-      transaction_nsu: body.transaction_nsu,
-      slug: body.invoice_slug || body.slug,
-      receipt_url: body.receipt_url,
-      capture_method: body.capture_method
-    });
-    return res.sendStatus(ok ? 200 : 400);
-  } catch (error) {
-    console.error("webhook_error", error);
-    return res.sendStatus(400);
-  }
-});
-
-
-app.post("/api/confirm-return", async (req, res) => {
-  try {
-    const { order_id, token, transaction_nsu, slug, receipt_url, capture_method } = req.body || {};
-    const owned = await pool.query("SELECT id FROM orders WHERE id=$1 AND access_token=$2", [order_id, token]);
-    if (!owned.rowCount) return res.sendStatus(404);
-    const paid = await confirmPayment({
-      order_nsu: order_id, transaction_nsu, slug, receipt_url, capture_method
-    });
-    return res.json({ paid });
-  } catch (error) {
-    console.error("return_confirmation_error", error);
-    return res.status(500).json({ error: "Não foi possível confirmar agora." });
-  }
-});
-
-app.get("/api/orders/:id", async (req, res) => {
-  const token = String(req.query.token || "");
-  const result = await pool.query("SELECT id,status,items,amount_cents,customer_email FROM orders WHERE id=$1 AND access_token=$2", [req.params.id, token]);
-  if (!result.rowCount) return res.sendStatus(404);
-  const order = result.rows[0];
-  const filesReady = order.status === "paid" && order.items.every(p => Array.isArray(p.files) && p.files.length > 0);
-  res.json({ status: order.status, amount_cents: order.amount_cents, files_ready: filesReady, message: filesReady ? "Pagamento confirmado. Seus arquivos estão disponíveis." : order.status === "paid" ? "Pagamento confirmado. Os arquivos deste produto ainda precisam ser cadastrados pela loja." : "Aguardando confirmação do pagamento." });
-});
-
-app.get("/pagamento-retorno", (req, res) => {
-  res.type("html").send(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Pedido | Artes & Vetores</title><body style="font:16px Arial;background:#101011;color:#f7f5ef;padding:40px;max-width:650px;margin:auto"><h1 style="color:#f0d58e">Estamos verificando seu pagamento</h1><p id="status">Aguarde enquanto confirmamos a transação com a InfinitePay. Não feche esta página.</p><a href="/" style="color:#f0d58e">Voltar à loja</a><script>
-const p=new URLSearchParams(location.search), order=p.get("order"), token=p.get("token");
-async function check(){if(!order||!token){document.getElementById("status").textContent="Não foi possível localizar o pedido.";return}
-try{
- const tx=p.get("transaction_nsu"), slug=p.get("slug");
- if(tx && slug){await fetch("/api/confirm-return",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({order_id:order,token,transaction_nsu:tx,slug,receipt_url:p.get("receipt_url"),capture_method:p.get("capture_method")})});}
- const r=await fetch("/api/orders/"+encodeURIComponent(order)+"?token="+encodeURIComponent(token));const d=await r.json();document.getElementById("status").textContent=d.message+(d.status==="paid"?" Pedido confirmado.": " A confirmação pode levar alguns instantes; atualize esta página.");}
-catch(e){document.getElementById("status").textContent="Não foi possível consultar agora. Tente novamente em instantes."}}
-check();
-</script></body></html>`);
-});
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-initDb().then(() => app.listen(PORT, () => console.log(`Artes & Vetores server listening on ${PORT}`))).catch(err => { console.error(err); process.exit(1); });
+app.get("/health",async(_q,s)=>{try{await pool.query("SELECT 1");s.json({ok:true,database:true,storage:storageReady(),adminConfigured:ADMIN.length>=12&&SECRET.length>=32});}catch(e){s.status(503).json({ok:false,error:"database"});}});
+app.post("/api/admin/login",rateLimit({windowMs:900000,limit:8}), (req,res)=>{if(ADMIN.length<12||SECRET.length<32)return res.status(503).json({error:"Painel ainda não configurado no Render."});const pass=String(req.body?.password||"");const a=Buffer.from(pass),b=Buffer.from(ADMIN);if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return res.status(401).json({error:"Senha incorreta."});const p=b64("admin");res.cookie("av_admin",p+"."+sign(p),{httpOnly:true,secure:true,sameSite:"strict",maxAge:8*60*60*1000,path:"/"});res.json({ok:true});});
+app.post("/api/admin/logout",(_q,s)=>{s.clearCookie("av_admin",{httpOnly:true,secure:true,sameSite:"strict",path:"/"});s.json({ok:true});});
+app.get("/api/products",async(_q,s)=>{try{const r=await pool.query("SELECT id,name,description,category,formats,price_cents,preview_path FROM products WHERE active=true ORDER BY created_at DESC");const items=await Promise.all(r.rows.map(async p=>({...p,preview_url:p.preview_path?await signedUrl(p.preview_path,1800).catch(()=>null):null})));s.json(items);}catch(e){console.error(e);s.status(500).json({error:"Não foi possível carregar os produtos."});}});
+app.get("/api/admin/products",admin,async(_q,s)=>{const r=await pool.query("SELECT * FROM products ORDER BY created_at DESC");s.json(r.rows);});
+app.post("/api/admin/products",admin,upload.fields([{name:"preview",maxCount:1},{name:"files",maxCount:10}]),async(req,res)=>{try{const name=String(req.body.name||"").trim(),price=Math.round(Number(req.body.price)*100);if(!name||!Number.isSafeInteger(price)||price<100) return res.status(400).json({error:"Informe nome e preço a partir de R$ 1,00."});const preview=req.files?.preview?.[0],files=req.files?.files||[];if(!preview||!files.length)return res.status(400).json({error:"Envie uma imagem de prévia e pelo menos um arquivo para entrega."});const previewPath=await uploadFile(preview),stored=[];for(const f of files)stored.push({name:f.originalname,path:await uploadFile(f),type:f.mimetype,size:f.size});const formats=String(req.body.formats||files.map(f=>path.extname(f.originalname).slice(1).toUpperCase()).join(", "));const r=await pool.query("INSERT INTO products(name,description,category,formats,price_cents,preview_path,files) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",[name,String(req.body.description||""),String(req.body.category||"PNG"),formats,price,previewPath,JSON.stringify(stored)]);res.status(201).json(r.rows[0]);}catch(e){console.error("product_create",e);res.status(500).json({error:e.message||"Erro ao cadastrar produto."});}});
+app.delete("/api/admin/products/:id",admin,async(req,res)=>{const r=await pool.query("UPDATE products SET active=false,updated_at=NOW() WHERE id=$1 RETURNING id",[req.params.id]);if(!r.rowCount)return res.sendStatus(404);res.json({ok:true});});
+app.get("/api/admin/orders",admin,async(_q,s)=>{const r=await pool.query("SELECT id,status,customer_name,customer_email,items,amount_cents,created_at FROM orders ORDER BY created_at DESC LIMIT 200");s.json(r.rows);});
+app.post("/api/checkout",async(req,res)=>{try{const {items,customer}=req.body||{};if(!Array.isArray(items)||!items.length||items.length>20)return res.status(400).json({error:"Carrinho inválido."});const name=String(customer?.name||"").trim().slice(0,120),email=String(customer?.email||"").trim().toLowerCase().slice(0,180);if(!name||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:"Informe nome e e-mail válidos."});const normalized=[];for(const x of items){const q=Number(x.quantity);if(!Number.isInteger(q)||q<1||q>20)return res.status(400).json({error:"Quantidade inválida."});const r=await pool.query("SELECT id,name,price_cents,files FROM products WHERE id=$1 AND active=true",[x.id]);if(!r.rowCount)return res.status(400).json({error:"Produto indisponível."});const p=r.rows[0];if(!Array.isArray(p.files)||!p.files.length)return res.status(400).json({error:"Este produto ainda não possui arquivo para entrega."});normalized.push({id:p.id,name:p.name,price:p.price_cents,quantity:q,files:p.files});}const total=normalized.reduce((a,p)=>a+p.price*p.quantity,0);if(!Number.isSafeInteger(total)||total<100)return res.status(400).json({error:"Pedido abaixo do mínimo de R$ 1,00."});const id=crypto.randomUUID(),token=crypto.randomBytes(32).toString("hex");await pool.query("INSERT INTO orders(id,access_token,customer_name,customer_email,items,amount_cents) VALUES($1,$2,$3,$4,$5,$6)",[id,token,name,email,JSON.stringify(normalized),total]);const payload={items:normalized.map(p=>({quantity:p.quantity,price:p.price,description:p.name})),order_nsu:id,redirect_url:origin()+"/pedido?order="+id+"&token="+token,webhook_url:origin()+"/api/webhooks/infinitepay",customer:{name,email}};const headers={"Content-Type":"application/json"};if(API_KEY)headers["X-Api-Key"]=API_KEY;else payload.handle=HANDLE;const response=await fetch("https://api.checkout.infinitepay.io/links",{method:"POST",headers,body:JSON.stringify(payload)}),data=await response.json().catch(()=>({}));if(!response.ok||!data.url){await pool.query("UPDATE orders SET status='checkout_error' WHERE id=$1",[id]);return res.status(502).json({error:"A InfinitePay não criou o checkout. Verifique o Checkout Integrado da conta."});}await pool.query("UPDATE orders SET checkout_url=$2 WHERE id=$1",[id,data.url]);res.json({checkout_url:data.url,order_id:id});}catch(e){console.error("checkout",e);res.status(500).json({error:"Não foi possível iniciar o pagamento."});}});
+async function confirmPayment(v){if(!v.order_nsu||!v.transaction_nsu||!v.slug)return false;const order=await pool.query("SELECT id FROM orders WHERE id=$1",[v.order_nsu]);if(!order.rowCount)return false;const headers={"Content-Type":"application/json"};if(API_KEY)headers["X-Api-Key"]=API_KEY;const response=await fetch("https://api.checkout.infinitepay.io/payment_check",{method:"POST",headers,body:JSON.stringify({handle:HANDLE,order_nsu:v.order_nsu,transaction_nsu:v.transaction_nsu,slug:v.slug})});const data=await response.json().catch(()=>({}));if(!response.ok||data.success!==true||data.paid!==true)return false;await pool.query("UPDATE orders SET status='paid',transaction_nsu=$2,invoice_slug=$3,capture_method=$4,receipt_url=$5,updated_at=NOW() WHERE id=$1",[v.order_nsu,v.transaction_nsu,v.slug,v.capture_method||null,v.receipt_url||null]);return true;}
+app.post("/api/webhooks/infinitepay",async(req,res)=>{try{const b=req.body||{};if(b.event==="refunded"||b.status==="refunded"){if(b.order_nsu)await pool.query("UPDATE orders SET status='refunded',updated_at=NOW() WHERE id=$1",[b.order_nsu]);return res.sendStatus(200);}const ok=await confirmPayment({order_nsu:b.order_nsu,transaction_nsu:b.transaction_nsu,slug:b.invoice_slug||b.slug,capture_method:b.capture_method,receipt_url:b.receipt_url});res.sendStatus(ok?200:400);}catch(e){console.error("webhook",e);res.sendStatus(400);}});
+app.get("/api/orders/:id",async(req,res)=>{const r=await pool.query("SELECT status,items,amount_cents FROM orders WHERE id=$1 AND access_token=$2",[req.params.id,String(req.query.token||"")]);if(!r.rowCount)return res.sendStatus(404);const o=r.rows[0];res.json({status:o.status,amount_cents:o.amount_cents,files_ready:o.status==="paid",message:o.status==="paid"?"Pagamento confirmado. Seus arquivos estão liberados.":"Aguardando confirmação do pagamento."});});
+app.get("/api/orders/:id/downloads",async(req,res)=>{const r=await pool.query("SELECT status,items FROM orders WHERE id=$1 AND access_token=$2",[req.params.id,String(req.query.token||"")]);if(!r.rowCount)return res.sendStatus(404);if(r.rows[0].status!=="paid")return res.status(403).json({error:"O pagamento ainda não foi confirmado."});const files=r.rows[0].items.flatMap(p=>(p.files||[]).map(f=>({name:f.name,url:null,path:f.path})));const result=await Promise.all(files.map(async f=>({name:f.name,url:await signedUrl(f.path,300)})));res.json({files:result});});
+app.get("/pedido",(req,res)=>{res.type("html").send("<!doctype html><html lang='pt-BR'><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Seu pedido | Artes & Vetores</title><body style='font:16px Arial;background:#111;color:#fff;padding:32px;max-width:650px;margin:auto'><h1 style='color:#e5c36c'>Seu pedido</h1><p id='state'>Verificando pagamento...</p><div id='downloads'></div><a href='/' style='color:#e5c36c'>Voltar à loja</a><script>const q=new URLSearchParams(location.search),id=q.get('order'),token=q.get('token');async function go(){try{const r=await fetch('/api/orders/'+encodeURIComponent(id)+'?token='+encodeURIComponent(token)),d=await r.json();document.getElementById('state').textContent=d.message;if(d.status==='paid'){const x=await fetch('/api/orders/'+encodeURIComponent(id)+'/downloads?token='+encodeURIComponent(token)),f=await x.json();document.getElementById('downloads').innerHTML=(f.files||[]).map(z=>'<p><a style=\"color:#e5c36c\" href=\"'+z.url+'\" target=\"_blank\" rel=\"noopener\">Baixar '+z.name.replace(/[<>]/g,'')+'</a></p>').join('');}else setTimeout(go,5000)}catch(e){document.getElementById('state').textContent='Não foi possível consultar. Atualize a página.'}}go();</script></body></html>");});
+app.get("/pagamento-retorno",(req,res)=>res.redirect("/pedido"+(req.url.includes("?")?req.url.slice(req.url.indexOf("?")):"")));
+app.listen(PORT,async()=>{try{await initDb();console.log("Artes & Vetores online na porta "+PORT);}catch(e){console.error("DB init failed",e);process.exit(1);}});
